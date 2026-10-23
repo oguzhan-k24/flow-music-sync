@@ -6,9 +6,10 @@ Durum (hangi mesaj işlendi) Slack'in kendisinde tutulur: bot, işlediği her
 mesaja emoji bırakır ve bir sonraki çalışmada o mesajları atlar.
   ✅  yeni şarkı(lar) playliste eklendi
   🔁  link geçerli ama şarkı zaten playlistte vardı
-  ❔  YouTube linkindeki şarkı Spotify'da güvenle bulunamadı
-YouTube linklerinde videonun başlığı okunur, Spotify'da aranır ve sadece
-sanatçı + şarkı adı yeterince eşleşirse eklenir.
+  ❔  YouTube / Apple Music linkindeki şarkı Spotify'da güvenle bulunamadı
+YouTube linklerinde videonun başlığı, Apple Music linklerinde Apple'ın
+şarkı/albüm bilgisi okunur; Spotify'da aranır ve sadece sanatçı + ad
+yeterince eşleşirse eklenir.
 Ayrıca playlistin mevcut içeriği her çalışmada okunur, yani aynı şarkı
 asla iki kez eklenmez.
 """
@@ -31,6 +32,10 @@ YOUTUBE_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?\S*?v=|shorts/|live/|embed/)|youtu\.be/)"
     r"([A-Za-z0-9_-]{11})"
 )
+APPLE_RE = re.compile(
+    r"https?://(?:geo\.)?music\.apple\.com/([a-z]{2})/(album|song)/"
+    r"(?:[^/\s?|>]+/)?(?:id)?(\d+)(?:\?[^\s|>]*?\bi=(\d+))?"
+)
 
 REACT_ADDED = "white_check_mark"
 REACT_DUPLICATE = "repeat"
@@ -40,8 +45,9 @@ MATCH_THRESHOLD = 0.75
 
 
 def env(name, default=None):
-    value = os.environ.get(name, default)
-    if value is None or value == "":
+    # Kopyalarken kaçan boşluk, satır sonu ve tırnakları temizle
+    value = (os.environ.get(name) or default or "").strip().strip('"').strip("'").strip()
+    if not value:
         sys.exit(f"Eksik ayar: {name} (GitHub Secrets'a eklendi mi?)")
     return value
 
@@ -206,6 +212,35 @@ def parse_youtube_title(title, channel):
     return artist, song, channel
 
 
+# ---------------------------------------------------------- Apple Music
+
+def clean_name(name):
+    name = FEAT.sub("", name or "")
+    name = re.sub(r"\s*[\(\[][^\)\]]*remaster[^\)\]]*[\)\]]", "", name, flags=re.I)
+    name = re.sub(r"\s+-\s+(Single|EP)$", "", name, flags=re.I)
+    return name.strip()
+
+
+def apple_info(country, kind, item_id, track_id):
+    """Apple Music linkinden {'type': 'track'|'album', 'artist', 'name'}."""
+    lookup_id = track_id or item_id
+    is_track = bool(track_id) or kind == "song"
+    try:
+        r = requests.get("https://itunes.apple.com/lookup",
+                         params={"id": lookup_id, "country": country}, timeout=15)
+        results = r.json().get("results", []) if r.status_code == 200 else []
+    except (requests.RequestException, ValueError):
+        return None
+    if not results:
+        return None
+    x = results[0]
+    if is_track and x.get("trackName"):
+        return {"type": "track", "artist": x.get("artistName", ""), "name": x["trackName"]}
+    if x.get("collectionName"):
+        return {"type": "album", "artist": x.get("artistName", ""), "name": x["collectionName"]}
+    return None
+
+
 # -------------------------------------------------------------- Spotify
 
 class Spotify:
@@ -218,8 +253,21 @@ class Spotify:
             auth=(client_id, client_secret), timeout=30,
         )
         if r.status_code != 200:
-            sys.exit(f"Spotify girişi başarısız ({r.status_code}): {r.text}\n"
-                     "Client ID/Secret veya refresh token yanlış olabilir.")
+            print(f"Spotify girişi başarısız ({r.status_code}): {r.text}")
+            # Teşhis: sadece ID+Secret ile giriş dene, token'ı devre dışı bırak
+            test = requests.post("https://accounts.spotify.com/api/token",
+                                 data={"grant_type": "client_credentials"},
+                                 auth=(client_id, client_secret), timeout=30)
+            print(f"  SPOTIFY_CLIENT_ID uzunluğu: {len(client_id)} (32 olmalı), "
+                  f"başı: {client_id[:4]}...")
+            print(f"  SPOTIFY_CLIENT_SECRET uzunluğu: {len(client_secret)} (32 olmalı)")
+            if client_id == client_secret:
+                sys.exit("SONUÇ: ID ve Secret aynı girilmiş. Secret'a Client Secret'ı koy.")
+            if test.status_code == 200:
+                sys.exit("SONUÇ: Client ID ve Secret DOĞRU. Sorun SPOTIFY_REFRESH_TOKEN'da, "
+                         "yeni token almak gerekiyor.")
+            sys.exit("SONUÇ: Client ID ve Secret ikilisi yanlış. Spotify panelindeki "
+                     "güncel değerlerle karşılaştır (secret yenilendiyse yenisini gir).")
         self.s = requests.Session()
         self.s.headers["Authorization"] = f"Bearer {r.json()['access_token']}"
         self._items_suffix = None
@@ -279,13 +327,12 @@ class Spotify:
             return []
         return r.json().get("tracks", {}).get("items", []) or []
 
-    def find_youtube_match(self, title, channel):
-        """YouTube başlığına en iyi uyan Spotify şarkısı; emin değilse None."""
-        artist, song, channel = parse_youtube_title(title, channel)
+    def best_track(self, artist, song, context):
+        """Sanatçı + şarkı adına en iyi uyan Spotify şarkısı; emin değilse None."""
         if not song:
             return None, 0.0
         n_song, n_artist = norm(song), norm(artist)
-        context = norm(f"{title} {channel}")
+        context = norm(context)
 
         candidates = {}
         for query in (f"track:{song} artist:{artist}" if artist else None, f"{artist} {song}".strip()):
@@ -296,7 +343,7 @@ class Spotify:
         best, best_score = None, 0.0
         for t in candidates.values():
             full_name = norm(t.get("name"))
-            base_name = norm(re.sub(r"\s+-\s+.*$|\s*[\(\[](feat|with|ft)[^\)\]]*[\)\]]",
+            base_name = norm(re.sub(r"\s+-\s+.*$|\s*[\(\[](feat|with|ft)\b[^\)\]]*[\)\]]",
                                     "", t.get("name", ""), flags=re.I))
             s_song = ratio(base_name, n_song)
             if base_name and f" {base_name} " in f" {context} ":
@@ -310,7 +357,7 @@ class Spotify:
                     s_artist = max(s_artist, 0.95)
 
             score = min(s_song, s_artist)
-            # Video "live/remix/cover" demiyorsa o versiyonları tercih etme
+            # Kaynak "live/remix/cover" demiyorsa o versiyonları tercih etme
             for word in VERSION_WORDS:
                 if word in full_name and word not in context:
                     score -= 0.3
@@ -318,6 +365,26 @@ class Spotify:
             if score > best_score:
                 best, best_score = t, score
 
+        if best_score >= MATCH_THRESHOLD:
+            return best, best_score
+        return None, best_score
+
+    def find_youtube_match(self, title, channel):
+        artist, song, channel = parse_youtube_title(title, channel)
+        return self.best_track(artist, song, f"{title} {channel}")
+
+    def best_album(self, artist, album):
+        r = self.req("GET", "/search", params={"q": f"album:{album} artist:{artist}",
+                                                "type": "album", "limit": 10, "market": "from_token"})
+        items = r.json().get("albums", {}).get("items", []) if r.status_code == 200 else []
+        n_album, n_artist = norm(album), norm(artist)
+        best, best_score = None, 0.0
+        for a in items or []:
+            s_name = ratio(norm(a.get("name")), n_album)
+            s_artist = max((ratio(norm(x.get("name")), n_artist) for x in a.get("artists", [])), default=0)
+            score = min(s_name, s_artist)
+            if score > best_score:
+                best, best_score = a, score
         if best_score >= MATCH_THRESHOLD:
             return best, best_score
         return None, best_score
@@ -347,6 +414,7 @@ def main():
     add_albums = env_bool("ADD_ALBUMS", True)
     include_threads = env_bool("INCLUDE_THREADS", True)
     youtube_lookup = env_bool("YOUTUBE_LOOKUP", True)
+    apple_lookup = env_bool("APPLE_LOOKUP", True)
     dry_run = env_bool("DRY_RUN", False)
 
     bot_user_id = slack.call("auth.test")["user_id"]
@@ -362,7 +430,8 @@ def main():
         text = message_text(m)
         refs = extract_refs(text)
         yt_ids = list(dict.fromkeys(YOUTUBE_RE.findall(text))) if youtube_lookup else []
-        if not refs and not yt_ids:
+        apple_refs = list(dict.fromkeys(APPLE_RE.findall(text))) if apple_lookup else []
+        if not refs and not yt_ids and not apple_refs:
             continue
 
         uris = []
@@ -384,6 +453,31 @@ def main():
             else:
                 yt_missing += 1
                 print(f"  ? YouTube '{title or vid}' Spotify'da güvenle bulunamadı ({score:.2f})")
+
+        for country, kind, item_id, track_id in apple_refs:
+            info = apple_info(country, kind, item_id, track_id)
+            if not info:
+                yt_missing += 1
+                print(f"  ? Apple Music {item_id} bilgisi okunamadı")
+                continue
+            label = f"{info['artist']} - {info['name']}"
+            if info["type"] == "track":
+                track, score = spotify.best_track(info["artist"], clean_name(info["name"]), label)
+                if track:
+                    artists = ", ".join(a["name"] for a in track.get("artists", []))
+                    print(f"  ▶ Apple '{label}' → Spotify '{artists} - {track['name']}' ({score:.2f})")
+                    uris.append(track["uri"])
+                    continue
+            elif add_albums:
+                album, score = spotify.best_album(info["artist"], clean_name(info["name"]))
+                if album:
+                    print(f"  ▶ Apple albüm '{label}' → Spotify albüm '{album['name']}' ({score:.2f})")
+                    uris += spotify.album_track_uris(album["id"])
+                    continue
+            else:
+                continue  # albümler kapalı
+            yt_missing += 1
+            print(f"  ? Apple '{label}' Spotify'da güvenle bulunamadı ({score:.2f})")
 
         if not uris:
             if yt_missing and not dry_run:
