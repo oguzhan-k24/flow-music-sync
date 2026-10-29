@@ -40,7 +40,7 @@ APPLE_RE = re.compile(
 REACT_ADDED = "white_check_mark"
 REACT_DUPLICATE = "repeat"
 REACT_NOT_FOUND = "grey_question"
-HANDLED = (REACT_ADDED, REACT_DUPLICATE, REACT_NOT_FOUND)
+HANDLED = (REACT_ADDED, REACT_DUPLICATE)  # ❔ olanlar her çalışmada tekrar denenir
 MATCH_THRESHOLD = 0.75
 
 
@@ -108,6 +108,10 @@ class Slack:
 
     def react(self, channel, ts, name):
         self.call("reactions.add", post=True, ok_errors=("already_reacted",),
+                  channel=channel, timestamp=ts, name=name)
+
+    def unreact(self, channel, ts, name):
+        self.call("reactions.remove", post=True, ok_errors=("no_reaction",),
                   channel=channel, timestamp=ts, name=name)
 
 
@@ -320,14 +324,15 @@ class Spotify:
                 raise RuntimeError(f"Playliste eklenemedi ({r.status_code}): {r.text}")
 
     def search_tracks(self, query):
-        r = self.req("GET", "/search", params={"q": query, "type": "track", "limit": 10,
-                                                "market": "from_token"})
-        if r.status_code != 200:
-            print(f"  ! Spotify araması başarısız ({r.status_code}): {query}")
-            return []
-        return r.json().get("tracks", {}).get("items", []) or []
+        for params in ({"q": query, "type": "track", "limit": 10, "market": "from_token"},
+                       {"q": query, "type": "track"}):
+            r = self.req("GET", "/search", params=params)
+            if r.status_code == 200:
+                return r.json().get("tracks", {}).get("items", []) or []
+        print(f"  ! Spotify araması başarısız ({r.status_code}): {query} -> {r.text[:200]}")
+        return []
 
-    def best_track(self, artist, song, context):
+    def best_track(self, artist, song, context, threshold=MATCH_THRESHOLD):
         """Sanatçı + şarkı adına en iyi uyan Spotify şarkısı; emin değilse None."""
         if not song:
             return None, 0.0
@@ -335,7 +340,8 @@ class Spotify:
         context = norm(context)
 
         candidates = {}
-        for query in (f"track:{song} artist:{artist}" if artist else None, f"{artist} {song}".strip()):
+        for query in (f"track:{song} artist:{artist}" if artist else None,
+                      f"{artist} {song}".strip(), song):
             if query:
                 for t in self.search_tracks(query):
                     candidates.setdefault(t["id"], t)
@@ -365,8 +371,14 @@ class Spotify:
             if score > best_score:
                 best, best_score = t, score
 
-        if best_score >= MATCH_THRESHOLD:
+        if best and best_score >= threshold:
             return best, best_score
+        if best:
+            names = ", ".join(a["name"] for a in best.get("artists", []))
+            print(f"    en yakın aday: '{names} - {best.get('name')}' ({best_score:.2f}), "
+                  f"aranan: '{artist} - {song}', {len(candidates)} sonuç")
+        else:
+            print(f"    Spotify hiç sonuç döndürmedi, aranan: '{artist} - {song}'")
         return None, best_score
 
     def find_youtube_match(self, title, channel):
@@ -462,7 +474,8 @@ def main():
                 continue
             label = f"{info['artist']} - {info['name']}"
             if info["type"] == "track":
-                track, score = spotify.best_track(info["artist"], clean_name(info["name"]), label)
+                track, score = spotify.best_track(info["artist"], clean_name(info["name"]), label,
+                                                  threshold=0.65)
                 if track:
                     artists = ", ".join(a["name"] for a in track.get("artists", []))
                     print(f"  ▶ Apple '{label}' → Spotify '{artists} - {track['name']}' ({score:.2f})")
@@ -500,6 +513,8 @@ def main():
                 print(f"  = {m['ts']}: zaten playlistte")
             if yt_missing:
                 slack.react(channel, m["ts"], REACT_NOT_FOUND)
+            else:
+                slack.unreact(channel, m["ts"], REACT_NOT_FOUND)
         except Exception as exc:  # bir mesaj patlasa da diğerleri devam etsin
             errors += 1
             print(f"  ! {m['ts']}: {exc}")
